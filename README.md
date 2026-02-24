@@ -1,2 +1,1 @@
-# SpectralSynthesis
-Bandwise Parametric PSD Coding and SRM-based Reconstruction
+# Residual Quantized Variational Autoencoder

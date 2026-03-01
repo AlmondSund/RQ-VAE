@@ -1,6 +1,0 @@
-# Ignore generated log artifacts in this folder
-*
-
-# Keep repository metadata
-!.gitignore
-!README.md

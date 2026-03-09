@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 
 FLOAT32_BITS = 32
 LENGTH_BITS = 16
@@ -593,11 +593,11 @@ def encode_fwht_frame(
             codec_config.quantization_bits,
         )
     else:
-        retained_indices = np.argpartition(
+        retained_index_candidates = np.argpartition(
             np.abs(dense_coefficients),
             -retained_coefficients,
         )[-retained_coefficients:]
-        retained_indices = np.sort(retained_indices.astype(np.int32))
+        retained_indices = np.sort(retained_index_candidates.astype(np.int32))
         quantization = quantize_symmetric_uniform(
             dense_coefficients[retained_indices],
             codec_config.quantization_bits,

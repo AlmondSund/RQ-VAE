@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fwht_codec import (
+from neural_compression.fwht_codec import (
     DatasetConfig,
     EncodedFWHTPayload,
     FWHTCodecConfig,

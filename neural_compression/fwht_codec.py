@@ -15,6 +15,7 @@ import csv
 import math
 import struct
 import zlib
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -41,6 +42,17 @@ NONLINEAR_MAP_FROM_CODE = {code: name for name, code in NONLINEAR_MAP_CODES.item
 AGGREGATION_DOMAIN_FROM_CODE = {
     code: name for name, code in AGGREGATION_DOMAIN_CODES.items()
 }
+FIDELITY_FIRST_DECIMATION_FACTOR = 1
+FIDELITY_FIRST_RETAINED_COEFFICIENTS = 192
+FIDELITY_FIRST_QUANTIZATION_BITS = 12
+FIDELITY_FIRST_NONLINEAR_MAP = "identity"
+FIDELITY_FIRST_AGGREGATION_DOMAIN = "linear_power"
+FIDELITY_RANKING_COLUMNS = (
+    "mean_rmse_db",
+    "mean_peak_error_hz",
+    "mean_centroid_error_hz",
+    "mean_bandwidth_error_hz",
+)
 
 
 @dataclass(frozen=True)
@@ -88,13 +100,18 @@ class DatasetConfig:
 
 @dataclass(frozen=True)
 class FWHTCodecConfig:
-    """Configuration of the deterministic FWHT transform coder."""
+    """Configuration of the deterministic FWHT transform coder.
 
-    decimation_factor: int = 2
-    retained_coefficients: int = 64
-    quantization_bits: int = 8
-    nonlinear_map: str = "identity"
-    aggregation_domain: str = "linear_power"
+    The defaults intentionally favor PSD reconstruction fidelity over aggressive
+    compression so narrowband peaks are not smoothed away before the Hadamard
+    sparsification stage is even evaluated.
+    """
+
+    decimation_factor: int = FIDELITY_FIRST_DECIMATION_FACTOR
+    retained_coefficients: int = FIDELITY_FIRST_RETAINED_COEFFICIENTS
+    quantization_bits: int = FIDELITY_FIRST_QUANTIZATION_BITS
+    nonlinear_map: str = FIDELITY_FIRST_NONLINEAR_MAP
+    aggregation_domain: str = FIDELITY_FIRST_AGGREGATION_DOMAIN
     input_bits_per_bin: int = 32
 
     def __post_init__(self) -> None:
@@ -121,10 +138,10 @@ class FWHTCodecConfig:
 class FWHTTransportConfig:
     """Transport-relevant codec parameters recoverable from a serialized packet."""
 
-    decimation_factor: int = 2
-    quantization_bits: int = 8
-    nonlinear_map: str = "identity"
-    aggregation_domain: str = "linear_power"
+    decimation_factor: int = FIDELITY_FIRST_DECIMATION_FACTOR
+    quantization_bits: int = FIDELITY_FIRST_QUANTIZATION_BITS
+    nonlinear_map: str = FIDELITY_FIRST_NONLINEAR_MAP
+    aggregation_domain: str = FIDELITY_FIRST_AGGREGATION_DOMAIN
 
     def __post_init__(self) -> None:
         """Validate the transport fields required for self-describing decode."""
@@ -196,6 +213,15 @@ class DecodedFWHTPacket:
     payload: EncodedFWHTPayload
     transport_config: FWHTTransportConfig
     serialization_version: int
+
+
+@dataclass(frozen=True)
+class FWHTAblationStage:
+    """Named group of codec settings for one fidelity-first ablation stage."""
+
+    stage_name: str
+    description: str
+    codec_configs: tuple[FWHTCodecConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -542,6 +568,180 @@ def next_power_of_two(
     if value < 1:
         raise ValueError("value must be positive.")
     return 1 if value == 1 else 1 << (value - 1).bit_length()
+
+
+def _canonicalize_positive_integer_sequence(
+    values: Sequence[int],  # Candidate sweep values supplied by the caller
+    parameter_name: str,  # Name used in validation errors
+    upper_bound: int | None = None,  # Optional maximum admissible value
+) -> tuple[int, ...]:
+    """Validate a sweep definition, preserve order, and remove duplicates."""
+    if len(values) == 0:
+        raise ValueError(f"{parameter_name} must contain at least one value.")
+
+    canonical_values: list[int] = []
+    seen_values: set[int] = set()
+
+    for raw_value in values:
+        integer_value = int(raw_value)
+        if integer_value != raw_value:
+            raise ValueError(f"{parameter_name} values must be integers.")
+        if integer_value < 1:
+            raise ValueError(f"{parameter_name} values must be positive.")
+        if upper_bound is not None:
+            integer_value = min(integer_value, upper_bound)
+        if integer_value in seen_values:
+            continue
+        seen_values.add(integer_value)
+        canonical_values.append(integer_value)
+
+    return tuple(canonical_values)
+
+
+def make_fidelity_first_codec_config(
+    retained_coefficients: int = FIDELITY_FIRST_RETAINED_COEFFICIENTS,  # Top-K budget
+    quantization_bits: int = FIDELITY_FIRST_QUANTIZATION_BITS,  # Signed scalar quantizer precision [bits]
+    aggregation_domain: str = FIDELITY_FIRST_AGGREGATION_DOMAIN,  # Domain used for optional decimation
+    input_bits_per_bin: int = 32,  # Reference raw payload precision [bits/bin]
+) -> FWHTCodecConfig:
+    """Build the recommended FWHT starting point for PSD-fidelity experiments.
+
+    The returned configuration intentionally disables decimation, keeps the
+    non-linear map literal, and raises both the coefficient budget and the
+    quantizer precision so transform mismatch can be evaluated before transport
+    pressure is reintroduced.
+    """
+    return FWHTCodecConfig(
+        decimation_factor=FIDELITY_FIRST_DECIMATION_FACTOR,
+        retained_coefficients=retained_coefficients,
+        quantization_bits=quantization_bits,
+        nonlinear_map=FIDELITY_FIRST_NONLINEAR_MAP,
+        aggregation_domain=aggregation_domain,
+        input_bits_per_bin=input_bits_per_bin,
+    )
+
+
+def build_fidelity_first_ablation_plan(
+    frame_length: int,  # Number of PSD bins on the original sensing grid
+    retained_coefficients_sweep: Sequence[int] = (128, 192, 256),  # Sparse-only K sweep
+    quantization_bits_sweep: Sequence[int] = (
+        12,
+        16,
+    ),  # Sparse-plus-quantized bit-depth sweep
+    quantization_stage_retained_coefficients: int = FIDELITY_FIRST_RETAINED_COEFFICIENTS,  # K fixed during bit-depth sweep
+    aggregation_domain: str = FIDELITY_FIRST_AGGREGATION_DOMAIN,  # PSD aggregation domain kept constant across stages
+    input_bits_per_bin: int = 32,  # Reference raw payload precision [bits/bin]
+) -> tuple[FWHTAblationStage, ...]:
+    """Create the staged fidelity-first FWHT ablation recommended for PSD tuning.
+
+    Purpose:
+        Separate the three main irreversible mechanisms in the codec:
+        decimation, top-K sparsification, and scalar quantization.
+
+    Parameters:
+        frame_length:
+            Number of bins on the original PSD grid. With decimation disabled,
+            this determines the padded Hadamard length used by Stage A.
+        retained_coefficients_sweep:
+            Candidate K values for the sparse-only sweep. Values above the padded
+            length are clipped to the padded length because the FWHT cannot retain
+            more coefficients than it has basis elements.
+        quantization_bits_sweep:
+            Candidate bit depths for the sparse-plus-quantized sweep.
+        quantization_stage_retained_coefficients:
+            Fixed K used while isolating quantization error in Stage C.
+        aggregation_domain:
+            Aggregation domain kept for API consistency. With
+            `decimation_factor=1`, it is inactive but still documented.
+        input_bits_per_bin:
+            Raw-reference bit depth used when computing compression ratio.
+
+    Returns:
+        Three ordered stages matching the recommended diagnostic workflow:
+        full-fidelity baseline, sparse-only sweep, and sparse-plus-quantized
+        sweep.
+    """
+    if frame_length < 1:
+        raise ValueError("frame_length must be positive.")
+
+    padded_length = next_power_of_two(frame_length)
+    sparse_sweep = _canonicalize_positive_integer_sequence(
+        retained_coefficients_sweep,
+        parameter_name="retained_coefficients_sweep",
+        upper_bound=padded_length,
+    )
+    quantization_sweep = _canonicalize_positive_integer_sequence(
+        quantization_bits_sweep,
+        parameter_name="quantization_bits_sweep",
+    )
+    quantization_stage_k = _canonicalize_positive_integer_sequence(
+        [quantization_stage_retained_coefficients],
+        parameter_name="quantization_stage_retained_coefficients",
+        upper_bound=padded_length,
+    )[0]
+
+    # Stage A removes both sparsity loss and quantization damage as much as the
+    # current codec allows so any remaining error points to representation issues.
+    full_fidelity_stage = FWHTAblationStage(
+        stage_name="stage_a_full_fidelity",
+        description=(
+            "No decimation, no sparsity loss, and high quantizer precision to "
+            "check whether the Hadamard representation itself can reproduce the PSD."
+        ),
+        codec_configs=(
+            make_fidelity_first_codec_config(
+                retained_coefficients=padded_length,
+                quantization_bits=max(16, max(quantization_sweep)),
+                aggregation_domain=aggregation_domain,
+                input_bits_per_bin=input_bits_per_bin,
+            ),
+        ),
+    )
+
+    # Stage B isolates top-K truncation by keeping decimation disabled and the
+    # quantizer comfortably above the recommended fidelity-tuning floor.
+    sparse_only_stage = FWHTAblationStage(
+        stage_name="stage_b_sparse_only",
+        description=(
+            "No decimation, sparse-only sweep. This measures the fidelity cost "
+            "of top-K truncation before quantization becomes the limiting factor."
+        ),
+        codec_configs=tuple(
+            make_fidelity_first_codec_config(
+                retained_coefficients=retained_coefficients,
+                quantization_bits=full_fidelity_stage.codec_configs[
+                    0
+                ].quantization_bits,
+                aggregation_domain=aggregation_domain,
+                input_bits_per_bin=input_bits_per_bin,
+            )
+            for retained_coefficients in sparse_sweep
+        ),
+    )
+
+    # Stage C fixes K and sweeps bit depth to isolate quantization error after
+    # the sparsity budget has been chosen from Stage B.
+    sparse_quantized_stage = FWHTAblationStage(
+        stage_name="stage_c_sparse_quantized",
+        description=(
+            "No decimation, fixed K, and a quantization sweep to measure the "
+            "incremental fidelity loss due to coefficient coding."
+        ),
+        codec_configs=tuple(
+            make_fidelity_first_codec_config(
+                retained_coefficients=quantization_stage_k,
+                quantization_bits=quantization_bits,
+                aggregation_domain=aggregation_domain,
+                input_bits_per_bin=input_bits_per_bin,
+            )
+            for quantization_bits in quantization_sweep
+        ),
+    )
+    return (
+        full_fidelity_stage,
+        sparse_only_stage,
+        sparse_quantized_stage,
+    )
 
 
 def fwht_orthonormal(
@@ -1869,6 +2069,56 @@ def summarize_results(
     return summary_df
 
 
+def rank_fidelity_results(
+    summary_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Rank operating points by PSD fidelity rather than occupancy or rate.
+
+    The ranking intentionally prioritizes reconstruction and PSD-derived feature
+    errors. Payload size is used only as a final tie-break once the main
+    fidelity metrics are indistinguishable.
+    """
+    if summary_df.empty:
+        raise ValueError("summary_df must contain at least one operating point.")
+
+    required_columns = [*FIDELITY_RANKING_COLUMNS, "mean_payload_bits"]
+    missing_columns = [
+        column_name
+        for column_name in required_columns
+        if column_name not in summary_df.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "summary_df is missing the columns required for fidelity ranking: "
+            + ", ".join(missing_columns)
+            + "."
+        )
+
+    ranking_source_df = summary_df.drop(columns=["fidelity_rank"], errors="ignore")
+    ranked_df = (
+        ranking_source_df.sort_values(
+            [*FIDELITY_RANKING_COLUMNS, "mean_payload_bits"],
+            ascending=[True, True, True, True, True],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+        .copy()
+    )
+    ranked_df.insert(
+        0,
+        "fidelity_rank",
+        np.arange(1, ranked_df.shape[0] + 1, dtype=np.int64),
+    )
+    return ranked_df
+
+
+def select_fidelity_operating_point(
+    summary_df: pd.DataFrame,
+) -> pd.Series:
+    """Return the highest-ranked operating point under the fidelity-first policy."""
+    return rank_fidelity_results(summary_df).iloc[0].copy()
+
+
 def select_representative_frame(
     frames: list[PsdFrame],
     dataset_config: DatasetConfig,
@@ -1902,6 +2152,13 @@ __all__ = [
     "DecodedFWHTPacket",
     "DatasetConfig",
     "EncodedFWHTPayload",
+    "FIDELITY_FIRST_AGGREGATION_DOMAIN",
+    "FIDELITY_FIRST_DECIMATION_FACTOR",
+    "FIDELITY_FIRST_NONLINEAR_MAP",
+    "FIDELITY_FIRST_QUANTIZATION_BITS",
+    "FIDELITY_FIRST_RETAINED_COEFFICIENTS",
+    "FIDELITY_RANKING_COLUMNS",
+    "FWHTAblationStage",
     "FWHTCodecConfig",
     "FWHTEncodeDiagnostics",
     "FWHTTransportConfig",
@@ -1948,6 +2205,7 @@ __all__ = [
     "linear_power_to_db",
     "load_psd_frames",
     "make_frequency_axis_hz",
+    "make_fidelity_first_codec_config",
     "materialize_sparse_coefficients",
     "match_occupied_components",
     "next_power_of_two",
@@ -1962,7 +2220,10 @@ __all__ = [
     "quantize_symmetric_uniform",
     "reconstruct_fwht_frame",
     "required_index_bits",
+    "build_fidelity_first_ablation_plan",
+    "rank_fidelity_results",
     "select_representative_frame",
+    "select_fidelity_operating_point",
     "serialize_payload",
     "spectral_centroid_hz",
     "spectral_peak_frequency_hz",

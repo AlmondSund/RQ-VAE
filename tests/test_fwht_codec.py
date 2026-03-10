@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd  # type: ignore[import-untyped]
 
 from neural_compression.fwht_codec import (
     CRC32_SIZE_BYTES,
@@ -18,6 +19,7 @@ from neural_compression.fwht_codec import (
     MAX_LENGTH_VALUE,
     PsdFrame,
     QuantizationState,
+    build_fidelity_first_ablation_plan,
     compute_block_layout,
     compute_component_metrics,
     compute_frame_metrics,
@@ -30,10 +32,13 @@ from neural_compression.fwht_codec import (
     estimate_payload_bits,
     fwht_orthonormal,
     make_frequency_axis_hz,
+    make_fidelity_first_codec_config,
     materialize_sparse_coefficients,
     quantize_symmetric_uniform,
+    rank_fidelity_results,
     required_index_bits,
     SERIALIZATION_VERSION,
+    select_fidelity_operating_point,
     serialize_payload,
     total_occupied_bandwidth_hz,
 )
@@ -489,6 +494,137 @@ class SensingMetricTests(unittest.TestCase):
 
         np.testing.assert_array_equal(block_starts, np.array([0, 3, 6, 9]))
         np.testing.assert_array_equal(block_lengths, np.array([3, 3, 3, 2]))
+
+
+class FidelityFirstWorkflowTests(unittest.TestCase):
+    """Tests for the fidelity-oriented FWHT operating-point helpers."""
+
+    def test_default_codec_config_uses_fidelity_first_operating_point(self) -> None:
+        """The public codec defaults should disable decimation and raise K/bit depth."""
+        codec_config = FWHTCodecConfig()
+
+        self.assertEqual(codec_config.decimation_factor, 1)
+        self.assertEqual(codec_config.retained_coefficients, 192)
+        self.assertEqual(codec_config.quantization_bits, 12)
+        self.assertEqual(codec_config.nonlinear_map, "identity")
+        self.assertEqual(codec_config.aggregation_domain, "linear_power")
+
+    def test_make_fidelity_first_codec_config_matches_recommended_baseline(
+        self,
+    ) -> None:
+        """The helper should expose the explicit fidelity-first starting point."""
+        codec_config = make_fidelity_first_codec_config()
+
+        self.assertEqual(codec_config, FWHTCodecConfig())
+
+    def test_fidelity_first_ablation_plan_matches_stage_recommendations(self) -> None:
+        """The staged ablation should isolate representation, sparsity, and quantization."""
+        stages = build_fidelity_first_ablation_plan(frame_length=200)
+
+        self.assertEqual(
+            [stage.stage_name for stage in stages],
+            [
+                "stage_a_full_fidelity",
+                "stage_b_sparse_only",
+                "stage_c_sparse_quantized",
+            ],
+        )
+
+        stage_a_config = stages[0].codec_configs[0]
+        self.assertEqual(stage_a_config.decimation_factor, 1)
+        self.assertEqual(stage_a_config.retained_coefficients, 256)
+        self.assertEqual(stage_a_config.quantization_bits, 16)
+
+        self.assertEqual(
+            [config.retained_coefficients for config in stages[1].codec_configs],
+            [128, 192, 256],
+        )
+        self.assertTrue(
+            all(config.decimation_factor == 1 for config in stages[1].codec_configs)
+        )
+        self.assertTrue(
+            all(config.quantization_bits == 16 for config in stages[1].codec_configs)
+        )
+
+        self.assertEqual(
+            [config.quantization_bits for config in stages[2].codec_configs],
+            [12, 16],
+        )
+        self.assertTrue(
+            all(
+                config.retained_coefficients == 192
+                for config in stages[2].codec_configs
+            )
+        )
+
+    def test_rank_fidelity_results_prioritizes_reconstruction_metrics(self) -> None:
+        """Ranking should favor RMSE and feature errors before occupancy or payload size."""
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "mean_rmse_db": 0.40,
+                    "mean_peak_error_hz": 2_000.0,
+                    "mean_centroid_error_hz": 1_500.0,
+                    "mean_bandwidth_error_hz": 1_000.0,
+                    "mean_payload_bits": 128.0,
+                    "mean_occupancy_f1": 0.99,
+                    "decimation_factor": 2,
+                    "retained_coefficients": 64,
+                    "quantization_bits": 8,
+                    "nonlinear_map": "identity",
+                    "aggregation_domain": "linear_power",
+                },
+                {
+                    "mean_rmse_db": 0.20,
+                    "mean_peak_error_hz": 200.0,
+                    "mean_centroid_error_hz": 150.0,
+                    "mean_bandwidth_error_hz": 100.0,
+                    "mean_payload_bits": 512.0,
+                    "mean_occupancy_f1": 0.80,
+                    "decimation_factor": 1,
+                    "retained_coefficients": 192,
+                    "quantization_bits": 12,
+                    "nonlinear_map": "identity",
+                    "aggregation_domain": "linear_power",
+                },
+            ]
+        )
+
+        ranked_df = rank_fidelity_results(summary_df)
+        recommended_row = select_fidelity_operating_point(summary_df)
+
+        self.assertEqual(int(ranked_df.iloc[0]["decimation_factor"]), 1)
+        self.assertEqual(int(recommended_row["retained_coefficients"]), 192)
+        self.assertEqual(int(recommended_row["quantization_bits"]), 12)
+
+    def test_select_fidelity_operating_point_accepts_already_ranked_results(
+        self,
+    ) -> None:
+        """Selecting twice should remain stable when the summary already has fidelity_rank."""
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "mean_rmse_db": 0.30,
+                    "mean_peak_error_hz": 1_000.0,
+                    "mean_centroid_error_hz": 800.0,
+                    "mean_bandwidth_error_hz": 600.0,
+                    "mean_payload_bits": 256.0,
+                },
+                {
+                    "mean_rmse_db": 0.10,
+                    "mean_peak_error_hz": 100.0,
+                    "mean_centroid_error_hz": 80.0,
+                    "mean_bandwidth_error_hz": 60.0,
+                    "mean_payload_bits": 512.0,
+                },
+            ]
+        )
+
+        ranked_df = rank_fidelity_results(summary_df)
+        recommended_row = select_fidelity_operating_point(ranked_df)
+
+        self.assertEqual(int(recommended_row["fidelity_rank"]), 1)
+        self.assertAlmostEqual(float(recommended_row["mean_rmse_db"]), 0.10)
 
 
 if __name__ == "__main__":

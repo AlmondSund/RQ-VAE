@@ -1,1 +1,1 @@
-# Towards AI-Native fronthaul: Neural Compression
+# PSD compression algorithms
